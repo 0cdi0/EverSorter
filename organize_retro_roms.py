@@ -21,6 +21,7 @@ Usage:
 from __future__ import annotations
 
 import argparse
+import io
 import re
 import shutil
 import sys
@@ -157,31 +158,45 @@ STOP = {
 
 
 class RomCandidate:
-    """A rom file, either sitting on disk directly or inside a zip archive."""
+    """A rom file, either sitting on disk directly or inside (possibly nested) zips.
 
-    __slots__ = ("display_name", "suffix", "path", "source_zip", "member")
+    Romsets are often distributed as one zip per system where every game is
+    itself a separate zip archive (e.g. "Nintendo - Game Boy Advance.zip" ->
+    "Golden Sun (USA).zip" -> "Golden Sun (USA).gba"). member_chain records
+    the full path of zip entry names needed to reach the actual rom file.
+    """
+
+    __slots__ = ("display_name", "suffix", "path", "source_zip", "member_chain")
 
     def __init__(self, path: Path):
         self.display_name = path.name
         self.suffix = path.suffix.lower()
         self.path = path
         self.source_zip: Path | None = None
-        self.member: str | None = None
+        self.member_chain: list[str] | None = None
 
     @classmethod
-    def from_zip_member(cls, zip_path: Path, member: str) -> "RomCandidate":
+    def from_zip_chain(cls, zip_path: Path, member_chain: list[str]) -> "RomCandidate":
         self = cls.__new__(cls)
-        self.display_name = Path(member).name
-        self.suffix = Path(member).suffix.lower()
+        self.display_name = Path(member_chain[-1]).name
+        self.suffix = Path(member_chain[-1]).suffix.lower()
         self.path = None
         self.source_zip = zip_path
-        self.member = member
+        self.member_chain = member_chain
         return self
 
     def describe(self) -> str:
         if self.source_zip is not None:
-            return f"{self.source_zip} :: {self.member}"
+            return f"{self.source_zip} :: " + " :: ".join(self.member_chain)
         return str(self.path)
+
+    def _read_bytes(self) -> bytes:
+        with zipfile.ZipFile(self.source_zip) as zf:
+            data = zf.read(self.member_chain[0])
+        for name in self.member_chain[1:]:
+            with zipfile.ZipFile(io.BytesIO(data)) as zf:
+                data = zf.read(name)
+        return data
 
     def copy_to(self, out_dir: Path, dry_run: bool) -> Path:
         out = out_dir / self.display_name
@@ -189,9 +204,7 @@ class RomCandidate:
             return out
         out_dir.mkdir(parents=True, exist_ok=True)
         if self.source_zip is not None:
-            with zipfile.ZipFile(self.source_zip) as zf, zf.open(self.member) as src:
-                with open(out, "wb") as dst:
-                    shutil.copyfileobj(src, dst)
+            out.write_bytes(self._read_bytes())
         elif self.path.resolve() != out.resolve():
             shutil.copy2(self.path, out)
         return out
@@ -229,6 +242,36 @@ def score(filename: str, title: str) -> int:
     return 0
 
 
+MAX_ZIP_NESTING = 4
+
+
+def _scan_zip(
+    zf: zipfile.ZipFile,
+    zip_path: Path,
+    wanted: set[str],
+    candidates: list[RomCandidate],
+    chain: list[str],
+    depth: int,
+) -> None:
+    if depth > MAX_ZIP_NESTING:
+        print(f"  WARN  Zip nested too deep, stopping: {zip_path} :: {' :: '.join(chain)}", file=sys.stderr)
+        return
+    for name in zf.namelist():
+        if name.endswith("/"):
+            continue
+        new_chain = chain + [name]
+        suffix = Path(name).suffix.lower()
+        if suffix in wanted:
+            candidates.append(RomCandidate.from_zip_chain(zip_path, new_chain))
+        elif suffix == ".zip":
+            try:
+                data = zf.read(name)
+                with zipfile.ZipFile(io.BytesIO(data)) as nested_zf:
+                    _scan_zip(nested_zf, zip_path, wanted, candidates, new_chain, depth + 1)
+            except (zipfile.BadZipFile, KeyError, RuntimeError, OSError):
+                print(f"  WARN  Skipping corrupt zip entry: {zip_path} :: {' :: '.join(new_chain)}", file=sys.stderr)
+
+
 def collect_roms(src: Path) -> list[RomCandidate]:
     wanted = set().union(*EXTS.values())
     candidates: list[RomCandidate] = []
@@ -238,13 +281,10 @@ def collect_roms(src: Path) -> list[RomCandidate]:
         if p.suffix.lower() in wanted:
             candidates.append(RomCandidate(p))
         elif p.suffix.lower() == ".zip":
+            print(f"  scanning {p.name} …")
             try:
                 with zipfile.ZipFile(p) as zf:
-                    for name in zf.namelist():
-                        if name.endswith("/"):
-                            continue
-                        if Path(name).suffix.lower() in wanted:
-                            candidates.append(RomCandidate.from_zip_member(p, name))
+                    _scan_zip(zf, p, wanted, candidates, [], 0)
             except zipfile.BadZipFile:
                 print(f"  WARN  Skipping corrupt zip: {p}", file=sys.stderr)
     return candidates
