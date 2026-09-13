@@ -310,12 +310,30 @@ def system_key(dest_rel: str) -> str:
     return dest_rel.split("/")[-1]
 
 
+def already_present_titles(dest: Path, rel: str, titles: list[str], min_score: int) -> set[str]:
+    """Titles for which out_dir already holds a file that would match well enough."""
+    out_dir = dest / rel
+    if not out_dir.is_dir():
+        return set()
+    names = [p.name for p in out_dir.iterdir() if p.is_file()]
+    return {
+        title
+        for title in titles
+        if any(score(name, title) >= min_score for name in names)
+    }
+
+
 def main() -> int:
     ap = argparse.ArgumentParser(description="Copy listed retro dumps into a folder tree.")
     ap.add_argument("--src", required=True, type=Path, help="Folder to search (your dump library)")
     ap.add_argument("--dest", required=True, type=Path, help="Destination root")
     ap.add_argument("--dry-run", action="store_true", help="Print actions only")
     ap.add_argument("--min-score", type=int, default=20, help="Minimum match score (default 20)")
+    ap.add_argument(
+        "--overwrite",
+        action="store_true",
+        help="Re-copy/decompress even if dest already appears to have the game",
+    )
     args = ap.parse_args()
 
     src = args.src.expanduser().resolve()
@@ -336,14 +354,20 @@ def main() -> int:
 
     missing: list[tuple[str, str]] = []
     copied = 0
+    skipped = 0
 
     for rel, titles in GAMES.items():
         sysname = system_key(rel)
         allowed = EXTS[sysname]
         pool = [c for c in roms if c.suffix in allowed]
         print(f"== {rel} ({len(pool)} files with right extension) ==")
+        already = set() if args.overwrite else already_present_titles(dest, rel, titles, args.min_score)
         used: set[RomCandidate] = set()
         for title in titles:
+            if title in already:
+                print(f"  SKIP  {title} (already in dest)")
+                skipped += 1
+                continue
             best_key: tuple[int, int] | None = None
             best_c: RomCandidate | None = None
             for c in pool:
@@ -373,6 +397,7 @@ def main() -> int:
         print()
 
     print(f"{'Would copy' if args.dry_run else 'Copied'}: {copied} files")
+    print(f"Skipped (already in dest): {skipped} files")
     print(f"Missing: {len(missing)}")
     if missing:
         print("\nNot found (dump may use another name, or you do not have it):")
