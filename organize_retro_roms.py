@@ -156,6 +156,11 @@ STOP = {
     "the", "of", "a", "an", "and", "in", "ii", "iii", "iv", "2", "3",
 }
 
+# Preferred region, best first. Used only to break ties between dumps of the
+# same game (e.g. picking a (Europe) dump over a (USA) one when both match
+# a title equally well). Edit this list to change the preference.
+REGION_ORDER = ["europe", "world", "usa", "japan"]
+
 
 class RomCandidate:
     """A rom file, either sitting on disk directly or inside (possibly nested) zips.
@@ -240,6 +245,17 @@ def score(filename: str, title: str) -> int:
     if len(toks) >= 3 and hits >= len(toks) - 1:
         return 20 + hits * 5
     return 0
+
+
+def region_priority(filename: str) -> int:
+    """Lower is more preferred. Reads (Region) style tags in the filename."""
+    tags = re.findall(r"\(([^)]*)\)", filename.lower())
+    best = len(REGION_ORDER)
+    for tag in tags:
+        for rank, region in enumerate(REGION_ORDER):
+            if region in tag:
+                best = min(best, rank)
+    return best
 
 
 MAX_ZIP_NESTING = 4
@@ -328,20 +344,25 @@ def main() -> int:
         print(f"== {rel} ({len(pool)} files with right extension) ==")
         used: set[RomCandidate] = set()
         for title in titles:
-            best: tuple[int, RomCandidate] | None = None
+            best_key: tuple[int, int] | None = None
+            best_c: RomCandidate | None = None
             for c in pool:
                 if c in used:
                     continue
                 sc = score(c.display_name, title)
                 if sc < args.min_score:
                     continue
-                if best is None or sc > best[0]:
-                    best = (sc, c)
-            if best is None:
+                # Higher score wins; among ties, lower region_priority (more
+                # preferred region) wins - hence the negation.
+                key = (sc, -region_priority(c.display_name))
+                if best_key is None or key > best_key:
+                    best_key = key
+                    best_c = c
+            if best_c is None:
                 print(f"  MISS  {title}")
                 missing.append((rel, title))
                 continue
-            sc, c = best
+            sc, c = best_key[0], best_c
             used.add(c)
             out_dir = dest / rel
             out = out_dir / c.display_name
